@@ -140,6 +140,7 @@ transcription and context recovery also work with Cloud API.
 - **@-mentions.** `reply` can tag people so they actually get notified — ids are accepted as phone, LID, or full JID, and mentions attach only to the chunk that names them.
 - **Full media support.** Photos, voice notes, video, documents, and stickers, in both directions.
 - **Polls.** `send_poll` asks a chat a question with up to 12 options; every vote comes back to the session as a message (linked device).
+- **Read receipts and pins.** `WHATSAPP_READ_RECEIPTS=1` gives senders blue ticks once Claude has their message, `mark_read` does it per message, and `pin_message` pins a message for 24h, 7d or 30d (linked device).
 - **Voice transcription.** Incoming voice notes are transcribed locally via mlx-whisper (see [setup](#voice-transcription-optional)); without the script they arrive as plain attachments.
 - **Access control.** Pairing codes, allowlists, and per-group policies gate every inbound message — strangers never reach your session. Managed via `/whatsapp-channel:access` in Claude Code, or `bun scripts/access.ts` anywhere.
 - **Per-group personalities.** Each group gets its own `config.md` with a custom personality and conversation memory.

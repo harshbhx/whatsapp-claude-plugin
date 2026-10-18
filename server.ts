@@ -4103,6 +4103,8 @@ const handleToolCall = async (
         );
         savePolls();
         markReplied(chat_id, pollRepliedIds);
+        // A poll answers the chat as much as a reply does.
+        typing.stop(chat_id);
         const pollGroupName = chat_id.endsWith("@g.us")
           ? await resolveGroupName(chat_id)
           : undefined;
