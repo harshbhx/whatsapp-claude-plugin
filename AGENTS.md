@@ -69,6 +69,7 @@ WhatsApp (phone) ←─ Baileys ─→ MCP Server (server.ts) ←─ stdio ─�
                             ├─ messages.jsonl   (inbound + owner/Claude context lines, pruned
                             │                    hourly to WHATSAPP_MESSAGE_TTL_DAYS, default 7)
                             ├─ sent.jsonl       (id + ts of the plugin's own sends, 24h)
+                            ├─ polls.json       (send_poll's polls + the secret their votes need, 30 days)
                             ├─ .aged-out-chats.json  (hashed chat_id -> when a WAITING line
                             │                    was pruned; 30 days; never written in static mode)
                             └─ inbox/     (attachments, pruned to the same horizon as messages.jsonl)

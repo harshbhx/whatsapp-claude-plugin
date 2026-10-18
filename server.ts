@@ -70,6 +70,20 @@ import { extractMentions, extractText } from "./lib/inbound-message";
 import { parseMaxStore } from "./lib/max-store";
 import { fileMessage } from "./lib/outbound-media";
 import {
+  addPoll,
+  candidatePairs,
+  decryptVote,
+  parsePollStore,
+  pickedOptions,
+  pollSpec,
+  pollTally,
+  POLL_TTL_MS,
+  recordVote,
+  serializePollStore,
+  voteText,
+  type PollRecord,
+} from "./lib/polls";
+import {
   formatLock,
   lockHolderState,
   lockIdentity,
@@ -151,6 +165,9 @@ const DM_ACTIVITY_FILE = join(STATE_DIR, "dm-activity.json");
 const MESSAGE_LOG = join(STATE_DIR, "messages.jsonl");
 // Every message id THIS server sent (see trackSent). Never an inbound id.
 const SENT_LOG = join(STATE_DIR, "sent.jsonl");
+// Every poll send_poll sent in the last 30 days, with the secret its votes
+// are sealed with (see lib/polls.ts). Without it a vote cannot be read.
+const POLLS_FILE = join(STATE_DIR, "polls.json");
 // Epoch-ms of the last address-book resync attempt (see syncSavedNamesOnce).
 // On disk, not in memory: the in-process cooldown resets every time the
 // watchdog cycles the server, and for an account with genuinely zero saved
@@ -2368,6 +2385,34 @@ function lookupKey(
   return { remoteJid: chat_id, fromMe, id: message_id };
 }
 
+// ─── Polls (survive restart) ────────────────────────────────────────────
+
+// Every poll send_poll sent, keyed by its message id, with the secret its
+// votes are sealed with. Persisted on every change, because a vote can come
+// days after the poll and across any number of restarts; the in-memory
+// messageProtoStore alone would lose the secret at the first one.
+const sentPolls: Map<string, PollRecord> = (() => {
+  try {
+    return parsePollStore(
+      existsSync(POLLS_FILE) ? readFileSync(POLLS_FILE, "utf8") : "",
+      Date.now() - POLL_TTL_MS,
+    );
+  } catch {
+    return new Map<string, PollRecord>();
+  }
+})();
+
+function savePolls(): void {
+  // Never throws into a send or a vote: the worst case is a lost vote tally.
+  try {
+    const tmp = POLLS_FILE + ".tmp";
+    writeFileSync(tmp, serializePollStore(sentPolls), { mode: 0o600 });
+    renameSync(tmp, POLLS_FILE);
+  } catch (err) {
+    logDiag(`${LOG_PREFIX}: failed to persist polls: ${err}\n`);
+  }
+}
+
 // ─── Message persistence (survives restart) ─────────────────────────────
 
 interface MessageLogEntry {
@@ -3324,6 +3369,44 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
               required: ["chat_id", "text"],
             },
           },
+          ...(PROVIDER === "cloud-api"
+            ? []
+            : [
+                {
+                  name: "send_poll",
+                  annotations: {
+                    title: "Send WhatsApp poll",
+                    readOnlyHint: false,
+                    destructiveHint: false,
+                  },
+                  description:
+                    'Send a poll to a chat: a question with 2 to 12 options people tap to answer. Single choice unless multiple is true. Each vote, change of vote or withdrawal later arrives as a normal inbound message reading "[Poll vote] <name> voted: "<option>" on "<question>"" with the current tally, and meta poll_id and option. Votes are only readable on polls sent with this tool.',
+                  inputSchema: {
+                    type: "object",
+                    properties: {
+                      chat_id: { type: "string" },
+                      question: {
+                        type: "string",
+                        description: "Up to 255 characters.",
+                      },
+                      options: {
+                        type: "array",
+                        items: { type: "string" },
+                        minItems: 2,
+                        maxItems: 12,
+                        description:
+                          "2 to 12 distinct answers, up to 100 characters each.",
+                      },
+                      multiple: {
+                        type: "boolean",
+                        description:
+                          "Allow picking more than one option. Default false.",
+                      },
+                    },
+                    required: ["chat_id", "question", "options"],
+                  },
+                },
+              ]),
           {
             name: "react",
             annotations: {
@@ -3841,6 +3924,76 @@ const handleToolCall = async (
             ? `sent (id: ${sentIds[0]})`
             : `sent ${sentIds.length} parts (ids: ${sentIds.join(", ")})`;
         return { content: [{ type: "text", text: result }] };
+      }
+
+      case "send_poll": {
+        if (PROVIDER === "cloud-api" || sock instanceof CloudApiSocket)
+          throw new Error(
+            "send_poll is not supported on Cloud API (linked device only)",
+          );
+        const chat_id = String(args.chat_id ?? "");
+        assertAllowedChat(chat_id);
+        const spec = pollSpec(args.question, args.options, args.multiple);
+        if (!sock) throw new Error("WhatsApp not connected");
+        // Snapshot before the await, same as `reply`: a poll answers what was
+        // waiting when it was sent, not what lands while it is in flight.
+        const pollRepliedIds = new Set(
+          getUnreplied()
+            .filter((m) => m.chat_id === chat_id)
+            .map((m) => m.id),
+        );
+        // Generated here rather than left to Baileys, so the secret every
+        // vote is sealed with is known before the send, whatever the returned
+        // message does or does not carry.
+        const secret = randomBytes(32);
+        const sent = await sock.sendMessage(chat_id, {
+          poll: { ...spec, messageSecret: secret },
+        });
+        const pollId = sent?.key?.id;
+        if (!sent || !pollId)
+          throw new Error("WhatsApp did not return an id for the poll");
+        trackSent(sent.key);
+        storeMessage(sent);
+        addPoll(
+          sentPolls,
+          {
+            id: pollId,
+            chat_id,
+            question: spec.name,
+            options: spec.values,
+            multiple: spec.selectableCount !== 1,
+            secret: secret.toString("base64"),
+            ts: Date.now(),
+            votes: Object.create(null),
+          },
+          Date.now() - POLL_TTL_MS,
+        );
+        savePolls();
+        markReplied(chat_id, pollRepliedIds);
+        const pollGroupName = chat_id.endsWith("@g.us")
+          ? await resolveGroupName(chat_id)
+          : undefined;
+        persistMessage({
+          id: pollId,
+          chat_id,
+          user: "You",
+          user_id: sock.user?.id ?? "self",
+          text: `(poll) ${spec.name} [${spec.values.join(" / ")}]`,
+          ts: new Date().toISOString(),
+          replied: true,
+          direction: "out",
+          ...(pollGroupName && pollGroupName !== chat_id
+            ? { group_name: pollGroupName }
+            : {}),
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: `poll sent (id: ${pollId}). Votes arrive as [Poll vote] messages.`,
+            },
+          ],
+        };
       }
 
       case "react": {
@@ -4752,9 +4905,154 @@ async function logOwnerHandReply(msg: WAMessage): Promise<void> {
   });
 }
 
+// ─── Poll votes ─────────────────────────────────────────────────────────
+
+// Who may have a vote delivered: exactly the chats a message would be
+// delivered from. Someone else's vote goes through the same gate() an inbound
+// message does, with mint=false so a vote never mints or refreshes a pairing
+// code; the owner's own vote (fromMe, cast on the phone) uses
+// logOwnerHandReply's rule. The one thing not required is a mention: a vote
+// on a poll this server sent is addressed to us, as a reply to our message is.
+function pollVoteAllowed(
+  chatJid: string,
+  voterJid: string,
+  fromMe: boolean,
+): boolean {
+  if (fromMe) {
+    const access = loadAccess();
+    if (chatJid.endsWith("@g.us")) return Object.hasOwn(access.groups, chatJid);
+    return (
+      access.dmPolicy !== "disabled" &&
+      isAllowedJid(jidNormalizedUser(chatJid), access.allowFrom)
+    );
+  }
+  const result = gate(chatJid, voterJid, "", [], false);
+  return (
+    result.action === "deliver" ||
+    (result.action === "drop" && result.reason === "no-mention")
+  );
+}
+
+// A vote is a pollUpdateMessage pointing at the poll by id, sealed with the
+// poll's secret (lib/polls.ts). Only polls in sentPolls can be read; a vote on
+// any other poll is dropped before anything about it is stored or logged.
+async function handlePollVote(
+  msg: WAMessage,
+  update: proto.Message.IPollUpdateMessage,
+  backlog: boolean,
+): Promise<void> {
+  const pollId = update.pollCreationMessageKey?.id;
+  const poll = pollId ? sentPolls.get(pollId) : undefined;
+  if (!pollId || !poll) return;
+  if (!sock || sock instanceof CloudApiSocket) return;
+  const chatJid = msg.key.remoteJid!;
+  // The vote must come from the chat the poll was sent to. contactKey maps a
+  // DM's @lid form to its phone form and leaves a group jid as it is.
+  if (contactKey(chatJid) !== contactKey(poll.chat_id)) return;
+  const isGroup = chatJid.endsWith("@g.us");
+  const fromMe = !!msg.key.fromMe;
+  const voterJid = fromMe
+    ? ownJid
+    : jidNormalizedUser(isGroup ? (msg.key.participant ?? "") : chatJid);
+  if (!voterJid) return;
+  if (!fromMe) await ensureLidResolved(voterJid);
+  if (!pollVoteAllowed(chatJid, voterJid, fromMe)) return;
+  // A replayed vote (same message id) was already counted and delivered.
+  if (msg.key.id && messageAlreadyLogged(msg.key.id)) return;
+
+  const self = sock.user;
+  const ownForms = [ownJid, self?.lid ? jidNormalizedUser(self.lid) : ""];
+  const phone = resolveToPhone(voterJid);
+  const voterForms = fromMe
+    ? ownForms
+    : [
+        voterJid,
+        isGroup ? msg.key.participantAlt : msg.key.remoteJidAlt,
+        phone,
+        // The @lid form of a voter we only know by number, from our own map.
+        Object.entries(lidMap).find(([, pn]) => pn === phone)?.[0],
+      ].map((j) => (j ? jidNormalizedUser(j) : ""));
+  const opened = decryptVote(
+    update.vote,
+    pollId,
+    Buffer.from(poll.secret, "base64"),
+    candidatePairs(ownForms, voterForms),
+  );
+  if (!opened) {
+    logDiag(`${LOG_PREFIX}: could not decrypt a vote on poll ${pollId}\n`);
+    return;
+  }
+  const picked = pickedOptions(poll, opened.selected);
+  recordVote(poll, contactKey(voterJid), picked);
+  savePolls();
+
+  const voterName = fromMe
+    ? ownerDisplayName()
+    : displaySenderName(msg.pushName, voterJid);
+  const text = neutralizeChannelTag(
+    voteText(voterName, poll.question, picked, pollTally(poll)),
+  );
+  const timestamp = Number(msg.messageTimestamp ?? 0);
+  const ts = new Date(
+    timestamp > 0 ? timestamp * 1000 : Date.now(),
+  ).toISOString();
+  const groupName = isGroup ? await resolveGroupName(chatJid) : undefined;
+  const messageId = msg.key.id ?? `vote-${Date.now()}`;
+  // Logged like any inbound message, so catch_up and unreplied show it and a
+  // backlog vote (cast while the server was offline) is not lost.
+  persistMessage({
+    id: messageId,
+    chat_id: chatJid,
+    user: voterName,
+    user_id: voterJid,
+    text,
+    ts,
+    replied: false,
+    direction: "in",
+    ...(groupName && groupName !== chatJid ? { group_name: groupName } : {}),
+  });
+  if (backlog) return;
+  const notifyParams = {
+    content: text,
+    meta: {
+      chat_id: chatJid,
+      message_id: messageId,
+      user: voterName,
+      user_id: voterJid,
+      ts,
+      poll_id: pollId,
+      option: picked.join(", "),
+      ...(ACCOUNT_NAME ? { account: ACCOUNT_NAME } : {}),
+      ...(isGroup
+        ? {
+            chat_type: "group",
+            group_name: groupName,
+            group_config_path: groupConfigPath(chatJid),
+            group_memory_path: groupMemoryPath(chatJid),
+          }
+        : {}),
+    },
+  };
+  mcp
+    .notification({
+      method: "notifications/claude/channel",
+      params: notifyParams,
+    })
+    .catch((err) => {
+      logDiag(`${LOG_PREFIX}: failed to deliver poll vote to Claude: ${err}\n`);
+    });
+  broadcastToSecondaries("notifications/claude/channel", notifyParams);
+}
+
 async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
   if (!msg.message) return;
   if (!msg.key.remoteJid) return;
+  // A poll vote carries no text or media, only an encrypted pick: it gets its
+  // own path, ahead of both the hand-reply and the inbound route (neither of
+  // which can read it). Before this it fell through to the inbound route and
+  // was dropped as empty, after the ack reaction had already gone out.
+  const pollUpdate = normalizeMessageContent(msg.message)?.pollUpdateMessage;
+  if (pollUpdate) return handlePollVote(msg, pollUpdate, backlog);
   // fromMe: our own echo, or the owner typing on their phone.
   if (msg.key.fromMe) {
     if (wasSentByServer(msg.key.id)) return;

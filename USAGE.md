@@ -104,7 +104,8 @@ To auto-allow only the WhatsApp tools, add them to your `~/.claude/settings.json
       "mcp__plugin_whatsapp-channel_whatsapp__react",
       "mcp__plugin_whatsapp-channel_whatsapp__status",
       "mcp__plugin_whatsapp-channel_whatsapp__download_attachment",
-      "mcp__plugin_whatsapp-channel_whatsapp__edit_message"
+      "mcp__plugin_whatsapp-channel_whatsapp__edit_message",
+      "mcp__plugin_whatsapp-channel_whatsapp__send_poll"
     ]
   }
 }
@@ -123,6 +124,7 @@ See **[ACCESS.md](./ACCESS.md)** for DM policies, groups, mention detection, del
 | Tool                  | Purpose                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `reply`               | Send to a chat. Takes `chat_id` + `text`, optionally `reply_to` (quote-reply), `files` (attachments), and `mentions` (names over raw numbers; `"all"` needs [roster access](./ACCESS.md#group-roster--all-mentions)).                                                                                                                                                                                                                |
+| `send_poll`           | Send a poll (2-12 options, `multiple` for several picks). Each vote arrives as a `[Poll vote]` message with the tally. Linked device only; see [Polls](#polls).                                                                                                                                                                                                                                                                      |
 | `react`               | Add an emoji reaction to a message by ID. Any emoji is supported.                                                                                                                                                                                                                                                                                                                                                                    |
 | `download_attachment` | Download media from a received message. Returns the local file path.                                                                                                                                                                                                                                                                                                                                                                 |
 | `edit_message`        | Edit a message the account previously sent.                                                                                                                                                                                                                                                                                                                                                                                          |
@@ -164,6 +166,12 @@ Inbound **photos** are downloaded eagerly to `~/.whatsapp-channel/inbox/` and th
 Other media types (**voice notes, audio, video, documents, stickers**) are lazy — the notification includes an `attachment_file_id`. The assistant calls `download_attachment` to fetch the file on demand.
 
 Outbound, `reply`'s `files` picks the message type from the extension: images send as photos, `.mp4`/`.mov`/`.avi` as video, `.mp3`/`.m4a` as audio, and anything else as a document. On linked device an `.ogg` or `.opus` file that contains Opus goes out as a **voice note** (push-to-talk, the green play button); an `.ogg` holding Vorbis stays a document, since WhatsApp voice notes have to be Opus. To turn other audio into a voice note: `ffmpeg -i in.wav -c:a libopus -b:a 32k -ac 1 note.ogg`. On Cloud API `.ogg` sends as plain audio, as before.
+
+## Polls
+
+`send_poll` sends a WhatsApp poll to an allowlisted chat (linked device only): a question and 2 to 12 options, single choice unless `multiple` is true. Every vote, change of vote or withdrawal comes back to the assistant as an ordinary inbound message, for example `[Poll vote] Akash voted: "Yes" on "Ship it?"` followed by the current tally, with `poll_id` and `option` in its meta. A vote goes through the same access gate as a message from that chat, minus the mention requirement (a vote on our own poll is addressed to us), and is listed by `catch_up` and `unreplied` like any other message.
+
+Votes are encrypted with a secret that only the poll's sender and its recipients hold. The server keeps that secret for every poll it sends, in `~/.whatsapp-channel/polls.json`, for 30 days (at most 200 polls). It cannot read votes on a poll it did not send (one created by hand on the phone, or sent before this version), or on a poll older than that.
 
 ## Dual-account setup
 
