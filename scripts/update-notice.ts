@@ -57,6 +57,13 @@ if (!isStaticMode()) {
   // latest.
   const CHANGELOG: { version: string; notes: string[] }[] = [
     {
+      version: "0.29.0",
+      notes: [
+        "Linked device: new send_poll tool sends a WhatsApp poll with 2 to 12 options.",
+        'Each vote on it reaches Claude as a "[Poll vote]" message with the current tally.',
+      ],
+    },
+    {
       version: "0.28.0",
       notes: [
         "Linked device: an Ogg Opus .ogg/.opus sent with reply now arrives as a voice note.",
