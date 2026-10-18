@@ -104,7 +104,8 @@ To auto-allow only the WhatsApp tools, add them to your `~/.claude/settings.json
       "mcp__plugin_whatsapp-channel_whatsapp__react",
       "mcp__plugin_whatsapp-channel_whatsapp__status",
       "mcp__plugin_whatsapp-channel_whatsapp__download_attachment",
-      "mcp__plugin_whatsapp-channel_whatsapp__edit_message"
+      "mcp__plugin_whatsapp-channel_whatsapp__edit_message",
+      "mcp__plugin_whatsapp-channel_whatsapp__send_poll"
     ]
   }
 }
