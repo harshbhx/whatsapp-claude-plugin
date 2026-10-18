@@ -61,6 +61,9 @@ if (!isStaticMode()) {
       notes: [
         "Linked device: new send_poll tool sends a WhatsApp poll with 2 to 12 options.",
         'Each vote on it reaches Claude as a "[Poll vote]" message with the current tally.',
+        'Linked device: "typing…" now stays up while Claude works on a message, until it replies.',
+        "It stops after 10 minutes at most; set WHATSAPP_TYPING_MAX_MINUTES to change that (0 = off).",
+        'reply shows "recording audio…" while it uploads a voice note; set_presence sets either by hand.',
       ],
     },
     {
