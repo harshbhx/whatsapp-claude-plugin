@@ -57,6 +57,13 @@ if (!isStaticMode()) {
   // latest.
   const CHANGELOG: { version: string; notes: string[] }[] = [
     {
+      version: "0.29.0",
+      notes: [
+        "Linked device: WHATSAPP_READ_RECEIPTS=1 gives senders blue ticks once Claude has their message.",
+        "New mark_read tool marks a single message read. Nothing is marked read unless you opt in.",
+      ],
+    },
+    {
       version: "0.28.0",
       notes: [
         "Linked device: an Ogg Opus .ogg/.opus sent with reply now arrives as a voice note.",

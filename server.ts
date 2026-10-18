@@ -79,6 +79,7 @@ import {
 } from "./lib/start-time";
 import { logContainsId } from "./lib/message-log-probe";
 import { type LoggedMessage, resolveMessageKey } from "./lib/message-key";
+import { parseReadReceipts } from "./lib/read-receipts";
 import { ownerStamp, parsePermissionReply } from "./lib/owner";
 import {
   type AgedOut,
@@ -232,6 +233,9 @@ const ACCOUNT_NAME = process.env.WHATSAPP_ACCOUNT_NAME || "";
 // Opt out per-terminal with WHATSAPP_QUIET=1 - never a config file, so it
 // can't silently persist past the session that set it.
 const AUTO_NOTIFY = process.env.WHATSAPP_QUIET !== "1";
+// Opt-in (lib/read-receipts.ts): blue ticks on a message once the agent has
+// it. Linked device only.
+const READ_RECEIPTS = parseReadReceipts(process.env.WHATSAPP_READ_RECEIPTS);
 // How long any stored log line lives (why one horizon, and why it is capped:
 // resolveTtlMs in lib/message-view.ts). Read here, not in the lib, so the lib
 // stays pure. TTL_NOTE is logged at startup rather than here - logDiag's own
@@ -3365,6 +3369,28 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
               required: ["file_id"],
             },
           },
+          ...(PROVIDER === "cloud-api"
+            ? []
+            : [
+                {
+                  name: "mark_read",
+                  annotations: {
+                    title: "Mark WhatsApp message read",
+                    readOnlyHint: false,
+                    destructiveHint: false,
+                  },
+                  description:
+                    "Mark a received message as read, which shows the sender blue ticks (only if this account's own read receipts are on in WhatsApp's privacy settings). Pass chat_id and message_id from the inbound message.",
+                  inputSchema: {
+                    type: "object",
+                    properties: {
+                      chat_id: { type: "string" },
+                      message_id: { type: "string" },
+                    },
+                    required: ["chat_id", "message_id"],
+                  },
+                },
+              ]),
           {
             name: "edit_message",
             annotations: {
@@ -3885,6 +3911,31 @@ const handleToolCall = async (
         const path = join(INBOX_DIR, `${Date.now()}-${uniqueId}${ext}`);
         writeFileSync(path, buffer);
         return { content: [{ type: "text", text: path }] };
+      }
+
+      case "mark_read": {
+        if (PROVIDER === "cloud-api" || sock instanceof CloudApiSocket)
+          throw new Error(
+            "mark_read is not supported on Cloud API (linked device only)",
+          );
+        const { chat_id, message_id } = z
+          .object({ chat_id: z.string().min(1), message_id: z.string().min(1) })
+          .parse(args);
+        assertAllowedChat(chat_id);
+        if (!sock) throw new Error("WhatsApp not connected");
+        const key = chatMessageKey(chat_id, message_id);
+        if (!key)
+          throw new Error(
+            `message ${message_id} is not one this server has seen in that chat`,
+          );
+        if (key.fromMe)
+          throw new Error(
+            "that is this account's own message; only received messages can be marked read",
+          );
+        await sock.readMessages([key]);
+        return {
+          content: [{ type: "text", text: `marked read (id: ${message_id})` }],
+        };
       }
 
       case "edit_message": {
@@ -5123,6 +5174,14 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
       logDiag(`${LOG_PREFIX}: failed to deliver inbound to Claude: ${err}\n`);
     });
   broadcastToSecondaries("notifications/claude/channel", notifyParams);
+  // Blue ticks once the agent has it, when the owner opted in. If the
+  // account's own read receipts are off, Baileys sends "read-self" instead,
+  // which clears the unread badge on the owner's devices and shows no ticks.
+  if (READ_RECEIPTS && sock && !(sock instanceof CloudApiSocket)) {
+    void sock.readMessages([msg.key]).catch((err) => {
+      logDiag(`${LOG_PREFIX}: read receipt failed: ${err}\n`);
+    });
+  }
 }
 
 // ─── Baileys connection with retry ─────────────────────────────────────
