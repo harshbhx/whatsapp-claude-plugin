@@ -583,6 +583,8 @@ export class CloudApiSocket {
     const to = recipient(jid);
     if ("edit" in content)
       throw new Error("Cloud API does not support editing messages");
+    if ("pin" in content)
+      throw new Error("Cloud API does not support pinning messages");
     if ("mentions" in content && content.mentions?.length)
       throw new Error("Cloud API does not support mentions");
     if (options?.quoted?.key?.remoteJid && options.quoted.key.remoteJid !== jid)

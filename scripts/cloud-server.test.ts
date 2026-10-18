@@ -283,6 +283,7 @@ test("real Cloud MCP server preserves access, permission identity and singleton 
     expect(names).not.toContain("send_poll");
     expect(names).not.toContain("set_presence");
     expect(names).not.toContain("mark_read");
+    expect(names).not.toContain("pin_message");
     const replyTool = replies
       .get(2)
       .result.tools.find((entry: any) => entry.name === "reply");

@@ -559,6 +559,9 @@ describe("Cloud API outgoing messages and media", () => {
       socket.sendMessage(jid, { text: "no", edit: { id: "old" } }),
     ).rejects.toThrow("editing");
     await expect(
+      socket.sendMessage(jid, { pin: { id: "old", remoteJid: jid }, type: 1 }),
+    ).rejects.toThrow("pinning");
+    await expect(
       socket.sendMessage(
         jid,
         { text: "no" },

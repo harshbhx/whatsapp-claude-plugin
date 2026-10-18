@@ -134,7 +134,7 @@ fees, opt-in requirements, and API-side validation.
 | Reply, reactions, outgoing files, attachment download/transcription | Yes                    | Yes, subject to service window/API rules |
 | Explicit approved template sends                                    | No                     | `send_template`                          |
 | Existing groups, group personalities and group cron                 | Yes                    | Unsupported in this implementation       |
-| Message editing                                                     | Yes                    | Unsupported in this implementation       |
+| Message editing and pinning                                         | Yes                    | Unsupported in this implementation       |
 | Phone address-book/history import                                   | Linked-device features | Unsupported                              |
 | Same-number Business App coexistence synchronization                | Not applicable         | Not implemented or promised              |
 

@@ -66,6 +66,7 @@ if (!isStaticMode()) {
         'reply shows "recording audio…" while it uploads a voice note; set_presence sets either by hand.',
         "Linked device: WHATSAPP_READ_RECEIPTS=1 marks messages read once Claude gets them (default off).",
         "New mark_read tool marks one received message read (blue ticks) by hand. Linked device only.",
+        "Linked device: new pin_message tool pins a message for 24h, 7d or 30d, or unpins it.",
       ],
     },
     {

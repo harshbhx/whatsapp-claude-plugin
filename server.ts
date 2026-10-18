@@ -69,6 +69,7 @@ import { cronMatches, parseCronSection } from "./lib/cron";
 import { extractMentions, extractText } from "./lib/inbound-message";
 import { parseMaxStore } from "./lib/max-store";
 import { fileMessage } from "./lib/outbound-media";
+import { DEFAULT_PIN_DURATION, pinContent } from "./lib/pin";
 import {
   addPoll,
   candidatePairs,
@@ -3553,6 +3554,38 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
             },
           },
           {
+            name: "pin_message",
+            annotations: {
+              title: "Pin WhatsApp message",
+              readOnlyHint: false,
+              destructiveHint: false,
+            },
+            description:
+              "Pin a message in a WhatsApp chat for everyone, or unpin it with unpin: true. Works on this account's own messages (e.g. a status board you keep editing) and on other people's messages, in allowlisted chats only. A chat shows at most 3 pins. In a group that only lets admins pin, the account has to be an admin.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                chat_id: { type: "string" },
+                message_id: {
+                  type: "string",
+                  description:
+                    "The message to pin: an id from reply's result or from an inbound <channel> block.",
+                },
+                duration: {
+                  type: "string",
+                  enum: ["24h", "7d", "30d"],
+                  description:
+                    "How long the pin lasts. Default 7d. WhatsApp offers only these three.",
+                },
+                unpin: {
+                  type: "boolean",
+                  description: "true removes the pin instead of setting one.",
+                },
+              },
+              required: ["chat_id", "message_id"],
+            },
+          },
+          {
             name: "status",
             annotations: {
               title: "WhatsApp connection status",
@@ -3660,6 +3693,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
               ![
                 "edit_message",
                 "mark_read",
+                "pin_message",
                 "list_groups",
                 "group_roster",
               ].includes(tool.name),
@@ -4213,6 +4247,32 @@ const handleToolCall = async (
         };
       }
 
+      case "pin_message": {
+        const chatId = args.chat_id as string;
+        const messageId = args.message_id as string;
+        assertAllowedChat(chatId);
+        if (!sock) throw new Error("WhatsApp not connected");
+        // This server's own sends never reach messageKeyStore (handleMessage
+        // returns on wasSentByServer before storeMessage), so sent.jsonl is
+        // what says a bare id is ours: pinning the agent's own message is the
+        // main use, and a fromMe:false key would point at nothing.
+        const pinKey = lookupKey(chatId, messageId, wasSentByServer(messageId));
+        const unpin = args.unpin === true;
+        // Built before the send so a bad duration fails without sending.
+        const content = pinContent(pinKey, { duration: args.duration, unpin });
+        await sendTracked(chatId, content);
+        return {
+          content: [
+            {
+              type: "text",
+              text: unpin
+                ? `unpinned (id: ${messageId})`
+                : `pinned for ${args.duration ?? DEFAULT_PIN_DURATION} (id: ${messageId})`,
+            },
+          ],
+        };
+      }
+
       case "status": {
         if (PROVIDER === "cloud-api") {
           const cloud = sock instanceof CloudApiSocket ? sock : undefined;
@@ -4226,7 +4286,7 @@ const handleToolCall = async (
             `DM policy: ${access.dmPolicy}`,
             `Allowed contacts: ${access.allowFrom.length}`,
             `Permission owner: ${permissionTarget(access) ? "configured" : "missing or revoked; set an allowlisted personal contact as owner"}`,
-            "Supported: DMs, replies, reactions, attachments, approved templates. Groups, message editing and read receipts are unavailable in this mode.",
+            "Supported: DMs, replies, reactions, attachments, approved templates. Groups, message editing, pinning and read receipts are unavailable in this mode.",
             "Free-form replies require an open 24-hour service window. Meta fees and AI-provider rules apply.",
           ];
           return { content: [{ type: "text", text: lines.join("\n") }] };
