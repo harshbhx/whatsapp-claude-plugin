@@ -57,6 +57,14 @@ if (!isStaticMode()) {
   // latest.
   const CHANGELOG: { version: string; notes: string[] }[] = [
     {
+      version: "0.29.0",
+      notes: [
+        'Linked device: "typing…" now stays up while Claude works on a message, until it replies.',
+        "It stops after 10 minutes at most; set WHATSAPP_TYPING_MAX_MINUTES to change that (0 = off).",
+        'reply shows "recording audio…" while it uploads a voice note; set_presence sets either by hand.',
+      ],
+    },
+    {
       version: "0.28.0",
       notes: [
         "Linked device: an Ogg Opus .ogg/.opus sent with reply now arrives as a voice note.",
