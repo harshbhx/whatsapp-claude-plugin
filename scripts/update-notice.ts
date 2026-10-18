@@ -57,6 +57,12 @@ if (!isStaticMode()) {
   // latest.
   const CHANGELOG: { version: string; notes: string[] }[] = [
     {
+      version: "0.29.0",
+      notes: [
+        "Linked device: new pin_message tool pins a message for 24h, 7d or 30d, or unpins it.",
+      ],
+    },
+    {
       version: "0.28.0",
       notes: [
         "Linked device: an Ogg Opus .ogg/.opus sent with reply now arrives as a voice note.",

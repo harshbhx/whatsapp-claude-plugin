@@ -154,7 +154,7 @@ WhatsApp linked device <──Baileys────────> MCP Server <─�
 WhatsApp business DMs   <──Cloud API/HTTPS─> MCP Server
 ```
 
-The server (a single Bun process) holds either the linked-device connection or the Cloud API webhook listener and forwards inbound messages after they pass the access gate. Claude acts through shared MCP tools such as `reply`, `react`, `download_attachment`, `status`, `unreplied` and `catch_up`. Provider-specific tools include linked-device group/edit operations and Cloud `send_template`. Runtime state lives in `~/.whatsapp-channel/` (or `WHATSAPP_STATE_DIR`), never in the repo.
+The server (a single Bun process) holds either the linked-device connection or the Cloud API webhook listener and forwards inbound messages after they pass the access gate. Claude acts through shared MCP tools such as `reply`, `react`, `download_attachment`, `status`, `unreplied` and `catch_up`. Provider-specific tools include linked-device group/edit/pin operations and Cloud `send_template`. Runtime state lives in `~/.whatsapp-channel/` (or `WHATSAPP_STATE_DIR`), never in the repo.
 
 Messages sent by Claude appear from your linked personal number or configured business number. Use a dedicated number if you want a distinct assistant identity.
 
