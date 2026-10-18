@@ -78,6 +78,7 @@ import {
   processStartTime,
 } from "./lib/start-time";
 import { logContainsId } from "./lib/message-log-probe";
+import { type LoggedMessage, resolveMessageKey } from "./lib/message-key";
 import { ownerStamp, parsePermissionReply } from "./lib/owner";
 import {
   type AgedOut,
@@ -5207,6 +5208,52 @@ function messageAlreadyLogged(id: string): boolean {
   } catch {
     return false;
   }
+}
+
+// The newest log line for a message id, while the log still has it: the chat,
+// the sender and the direction, which is what turns a bare message_id back
+// into a full key once the in-memory store has lost it. Each candidate line is
+// parsed and its `id` compared exactly - a contact can type any id they like
+// into a message's text, and a substring match alone would find that line.
+function findLoggedMessage(id: string): LoggedMessage | undefined {
+  if (!id) return undefined;
+  try {
+    if (!existsSync(MESSAGE_LOG)) return undefined;
+    let found: LoggedMessage | undefined;
+    for (const line of readFileSync(MESSAGE_LOG, "utf8").split("\n")) {
+      if (!line.includes(id)) continue;
+      try {
+        const entry = JSON.parse(line) as Partial<MessageLogEntry>;
+        if (entry.id === id && typeof entry.chat_id === "string")
+          found = {
+            id,
+            chat_id: entry.chat_id,
+            user_id: typeof entry.user_id === "string" ? entry.user_id : "",
+            direction: entry.direction,
+          };
+      } catch {}
+    }
+    return found;
+  } catch {
+    return undefined;
+  }
+}
+
+// The full key of `message_id` in `chat_id`, from the best source that still
+// has it (lib/message-key.ts). null = this server has no record of the id;
+// throws when the id belongs to a different chat.
+function chatMessageKey(
+  chat_id: string,
+  message_id: string,
+): WAMessageKey | null {
+  return resolveMessageKey({
+    chatId: chat_id,
+    messageId: message_id,
+    stored: messageKeyStore.get(message_id),
+    logged: findLoggedMessage(message_id),
+    sentByServer: wasSentByServer(message_id),
+    sameChat: (a, b) => contactKey(a) === contactKey(b),
+  });
 }
 
 const BACKLOG_SKEW_TOLERANCE_MS = 60_000;
