@@ -141,6 +141,7 @@ transcription and context recovery also work with Cloud API.
 - **Full media support.** Photos, voice notes, video, documents, and stickers, in both directions.
 - **Polls.** `send_poll` asks a chat a question with up to 12 options; every vote comes back to the session as a message (linked device).
 - **Read receipts and pins.** `WHATSAPP_READ_RECEIPTS=1` gives senders blue ticks once Claude has their message, `mark_read` does it per message, and `pin_message` pins a message for 24h, 7d or 30d (linked device).
+- **Read alerts.** `message_status` says whether a message Claude sent was delivered and read, and by whom; `reply` with `urgent_minutes` lists it in `urgent-watch.json` so your own watcher can escalate it while it stays unread ([details](./USAGE.md#read-alerts)).
 - **Voice transcription.** Incoming voice notes are transcribed locally via mlx-whisper (see [setup](#voice-transcription-optional)); without the script they arrive as plain attachments.
 - **Access control.** Pairing codes, allowlists, and per-group policies gate every inbound message — strangers never reach your session. Managed via `/whatsapp-channel:access` in Claude Code, or `bun scripts/access.ts` anywhere.
 - **Per-group personalities.** Each group gets its own `config.md` with a custom personality and conversation memory.
@@ -157,7 +158,7 @@ WhatsApp linked device <──Baileys────────> MCP Server <─�
 WhatsApp business DMs   <──Cloud API/HTTPS─> MCP Server
 ```
 
-The server (a single Bun process) holds either the linked-device connection or the Cloud API webhook listener and forwards inbound messages after they pass the access gate. Claude acts through shared MCP tools such as `reply`, `react`, `download_attachment`, `status`, `unreplied` and `catch_up`. Provider-specific tools include linked-device group, edit, read-receipt (`mark_read`), pin (`pin_message`), poll (`send_poll`) and presence (`set_presence`) operations, and Cloud `send_template`. Runtime state lives in `~/.whatsapp-channel/` (or `WHATSAPP_STATE_DIR`), never in the repo.
+The server (a single Bun process) holds either the linked-device connection or the Cloud API webhook listener and forwards inbound messages after they pass the access gate. Claude acts through shared MCP tools such as `reply`, `react`, `download_attachment`, `message_status`, `status`, `unreplied` and `catch_up`. Provider-specific tools include linked-device group, edit, read-receipt (`mark_read`), pin (`pin_message`), poll (`send_poll`) and presence (`set_presence`) operations, and Cloud `send_template`. Runtime state lives in `~/.whatsapp-channel/` (or `WHATSAPP_STATE_DIR`), never in the repo.
 
 Messages sent by Claude appear from your linked personal number or configured business number. Use a dedicated number if you want a distinct assistant identity.
 

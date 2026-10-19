@@ -108,7 +108,8 @@ To auto-allow only the WhatsApp tools, add them to your `~/.claude/settings.json
       "mcp__plugin_whatsapp-channel_whatsapp__send_poll",
       "mcp__plugin_whatsapp-channel_whatsapp__set_presence",
       "mcp__plugin_whatsapp-channel_whatsapp__mark_read",
-      "mcp__plugin_whatsapp-channel_whatsapp__pin_message"
+      "mcp__plugin_whatsapp-channel_whatsapp__pin_message",
+      "mcp__plugin_whatsapp-channel_whatsapp__message_status"
     ]
   }
 }
@@ -126,7 +127,7 @@ See **[ACCESS.md](./ACCESS.md)** for DM policies, groups, mention detection, del
 
 | Tool                  | Purpose                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `reply`               | Send to a chat. Takes `chat_id` + `text`, optionally `reply_to` (quote-reply), `files` (attachments), and `mentions` (names over raw numbers; `"all"` needs [roster access](./ACCESS.md#group-roster--all-mentions)).                                                                                                                                                                                                                |
+| `reply`               | Send to a chat. Takes `chat_id` + `text`, optionally `reply_to` (quote-reply), `files` (attachments), `mentions` (names over raw numbers; `"all"` needs [roster access](./ACCESS.md#group-roster--all-mentions)) and `urgent_minutes` (1-1440, see [Read alerts](#read-alerts)).                                                                                                                                                     |
 | `send_poll`           | Send a poll (2-12 options, `multiple` for several picks). Each vote arrives as a `[Poll vote]` message with the tally. Linked device only; see [Polls](#polls).                                                                                                                                                                                                                                                                      |
 | `react`               | Add an emoji reaction to a message by ID. Any emoji is supported.                                                                                                                                                                                                                                                                                                                                                                    |
 | `set_presence`        | Show `composing` ("typing…") or `recording` in a chat until the next reply there, or clear it with `paused`. Linked device only; see [Typing indicator](#typing-indicator).                                                                                                                                                                                                                                                          |
@@ -134,6 +135,7 @@ See **[ACCESS.md](./ACCESS.md)** for DM policies, groups, mention detection, del
 | `edit_message`        | Edit a message the account previously sent.                                                                                                                                                                                                                                                                                                                                                                                          |
 | `mark_read`           | Mark a received message read (blue ticks) by ID. Linked device only. `WHATSAPP_READ_RECEIPTS=1` does it for every delivered message ([ACCESS.md](./ACCESS.md#read-receipts)).                                                                                                                                                                                                                                                        |
 | `pin_message`         | Pin a message for everyone for `duration` `24h`, `7d` (default) or `30d`, or unpin it with `unpin: true`. Works on the account's own messages and others'. Linked device only.                                                                                                                                                                                                                                                       |
+| `message_status`      | Whether a message sent with `reply`, `send_poll` or `send_template` in the last 7 days was delivered and read, with UTC times and who read it (saved names, or masked numbers). See [Read alerts](#read-alerts).                                                                                                                                                                                                                     |
 | `status`              | Check connection state and get the pairing code if not yet paired.                                                                                                                                                                                                                                                                                                                                                                   |
 | `unreplied`           | List received messages not yet replied to, with their chat_ids. Pass `chat_id` for one chat. Shows at most 100 per call (the newest), after that filter; `wait_for_messages` has the same ceiling.                                                                                                                                                                                                                                   |
 | `wait_for_messages`   | Park up to 40s for messages this connection has not been handed yet. The first call returns whatever is already unreplied; later calls only what arrived since. Mainly for MCP clients other than Claude Code, which pushes messages into the session itself.                                                                                                                                                                        |
@@ -184,6 +186,45 @@ Outbound, `reply`'s `files` picks the message type from the extension: images se
 `send_poll` sends a WhatsApp poll to an allowlisted chat (linked device only): a question and 2 to 12 options, single choice unless `multiple` is true. Every vote, change of vote or withdrawal comes back to the assistant as an ordinary inbound message, for example `[Poll vote] Akash voted: "Yes" on "Ship it?"` followed by the current tally, with `poll_id` and `option` in its meta. A vote goes through the same access gate as a message from that chat, minus the mention requirement (a vote on our own poll is addressed to us), and is listed by `catch_up` and `unreplied` like any other message.
 
 Votes are encrypted with a secret that only the poll's sender and its recipients hold. The server keeps that secret for every poll it sends, in `~/.whatsapp-channel/polls.json`, for 30 days (at most 200 polls). It cannot read votes on a poll it did not send (one created by hand on the phone, or sent before this version), or on a poll older than that.
+
+## Read alerts
+
+The server records delivery and read receipts (the grey and blue ticks) for every message its tools send: `reply` (each part), `send_poll` and `send_template`. Messages you type on the phone and inbound messages are not tracked. `message_status` with the chat and message id answers `sent`, `delivered` or `read`, with times and, in a group, every member whose read receipt arrived. Someone who turned read receipts off in their privacy settings never shows as read.
+
+The records live in `~/.whatsapp-channel/receipts.json`, one entry per message id, pruned after 7 days (at most 5000) and written atomically at most every 2 seconds:
+
+```json
+{
+  "3EB0C431D5A7F2B1E0AA": {
+    "chat_id": "15551234567@s.whatsapp.net",
+    "sent_at": "2026-10-18T10:00:00.000Z",
+    "delivered_at": "2026-10-18T10:00:02.000Z",
+    "read_at": "2026-10-18T10:04:51.000Z",
+    "read_by": ["15551234567@s.whatsapp.net"]
+  }
+}
+```
+
+`delivered_at` and `read_at` are the first delivery and the first read (`null` until then); a read implies delivery. A voice note that was played counts as read.
+
+**Urgent replies.** `reply` with `urgent_minutes: N` (1 to 1440) also appends the message to `~/.whatsapp-channel/urgent-watch.json`, a JSON array:
+
+```json
+[
+  {
+    "message_id": "3EB0C431D5A7F2B1E0AA",
+    "chat_id": "15551234567@s.whatsapp.net",
+    "preview": "first 120 characters of the text",
+    "sent_at": "2026-10-18T10:00:00.000Z",
+    "escalate_after_min": 15,
+    "escalated": false
+  }
+]
+```
+
+The server only appends; it never escalates anything itself. A watcher you run (a cron script, for example) reads this file with `receipts.json`, alerts you through another channel when an entry is still unread `escalate_after_min` minutes after `sent_at`, and flips `escalated` or removes entries that were read. To edit the file safely, hold an exclusive `flock` on `urgent-watch.json.lock` (Python: `fcntl.flock(f, fcntl.LOCK_EX)`) while you read it and write it back, and write it atomically (temporary file, then rename). The server appends under the same lock. A message split into several parts is watched by its first part's id, which is the first id in `reply`'s result.
+
+On Cloud API the receipts come from Meta's status webhooks (`delivered`, `read`), so they need the webhook's `messages` subscription; their times are when the webhook arrived. `urgent_minutes` works the same on both providers.
 
 ## Dual-account setup
 

@@ -135,6 +135,7 @@ fees, opt-in requirements, and API-side validation.
 | Explicit approved template sends                                    | No                     | `send_template`                          |
 | Existing groups, group personalities and group cron                 | Yes                    | Unsupported in this implementation       |
 | Message editing and pinning                                         | Yes                    | Unsupported in this implementation       |
+| Delivery/read status of sent messages (`message_status`)            | Yes                    | Yes, from status webhooks                |
 | Phone address-book/history import                                   | Linked-device features | Unsupported                              |
 | Same-number Business App coexistence synchronization                | Not applicable         | Not implemented or promised              |
 

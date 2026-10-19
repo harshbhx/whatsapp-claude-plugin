@@ -70,6 +70,9 @@ WhatsApp (phone) ←─ Baileys ─→ MCP Server (server.ts) ←─ stdio ─�
                             │                    hourly to WHATSAPP_MESSAGE_TTL_DAYS, default 7)
                             ├─ sent.jsonl       (id + ts of the plugin's own sends, 24h)
                             ├─ polls.json       (send_poll's polls + the secret their votes need, 30 days)
+                            ├─ receipts.json    (delivery/read receipts of tool-sent messages, 7 days)
+                            ├─ urgent-watch.json (reply's urgent_minutes entries; an outside watcher
+                            │                    edits it too, both under a flock on its .lock file)
                             ├─ .aged-out-chats.json  (hashed chat_id -> when a WAITING line
                             │                    was pruned; 30 days; never written in static mode)
                             └─ inbox/     (attachments, pruned to the same horizon as messages.jsonl)
@@ -78,7 +81,8 @@ WhatsApp (phone) ←─ Baileys ─→ MCP Server (server.ts) ←─ stdio ─�
 - **`server.ts`** — the entire MCP server in one file (~5400 lines; re-check with
   `wc -l` rather than trusting this number). MCP tools exposed to Claude: `reply`,
   `send_poll`, `react`, `set_presence`, `download_attachment`, `edit_message`,
-  `mark_read`, `pin_message`, `status`, `unreplied`, `catch_up`, `list_groups`.
+  `mark_read`, `pin_message`, `message_status`, `status`, `unreplied`, `catch_up`,
+  `list_groups`.
   Also contains: access-control engine (DM policies `pairing`/`allowlist`/`disabled`,
   group policies, pairing codes with 1-hour TTL, LID↔phone mapping), message pipeline
   (access gate → routing → mention detection → text/media extraction → optional

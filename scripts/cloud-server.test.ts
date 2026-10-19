@@ -133,6 +133,15 @@ async function startCloudServer(
   const notified = (id: string) =>
     notifications.some((entry) => entry.params?.meta?.message_id === id);
   async function post(message: Record<string, unknown>): Promise<Response> {
+    return postValue({ messages: [message] });
+  }
+  /** Delivery/read statuses for messages the server sent, as Meta posts them. */
+  async function postStatuses(
+    statuses: Record<string, unknown>[],
+  ): Promise<Response> {
+    return postValue({ statuses });
+  }
+  async function postValue(value: Record<string, unknown>): Promise<Response> {
     const raw = JSON.stringify({
       object: "whatsapp_business_account",
       entry: [
@@ -143,7 +152,7 @@ async function startCloudServer(
               value: {
                 messaging_product: "whatsapp",
                 metadata: { phone_number_id: "12345" },
-                messages: [message],
+                ...value,
               },
             },
           ],
@@ -226,6 +235,7 @@ async function startCloudServer(
     loggedLines,
     notified,
     deliver,
+    postStatuses,
     stopProcess,
     close,
   };
@@ -278,6 +288,7 @@ test("real Cloud MCP server preserves access, permission identity and singleton 
     const names = replies.get(2).result.tools.map((entry: any) => entry.name);
     expect(names).toContain("send_template");
     expect(names).toContain("reply");
+    expect(names).toContain("message_status");
     expect(names).not.toContain("list_groups");
     expect(names).not.toContain("edit_message");
     expect(names).not.toContain("send_poll");
@@ -639,6 +650,146 @@ test("Cloud sends permission requests only to an ownerExplicit owner", async () 
     expect(server.graphSends()[0].to).toBe("886900000001");
     expect(server.stderr()).not.toContain(
       "permission_request request-explicit not sent",
+    );
+  } finally {
+    await server.close();
+  }
+}, 60000);
+
+test("Cloud: an urgent reply is watched, and status webhooks reach message_status and receipts.json", async () => {
+  const server = await startCloudServer({
+    dmPolicy: "allowlist",
+    allowFrom: [owner],
+    groups: {},
+    pending: {},
+  });
+  const { dir, tool, text, postStatuses } = server;
+  const watchPath = join(dir, "urgent-watch.json");
+  const receiptsPath = join(dir, "receipts.json");
+  try {
+    // A bad value fails before anything is sent.
+    const bad = await tool("reply", {
+      chat_id: owner,
+      text: "never sent",
+      urgent_minutes: 0,
+    });
+    expect(bad.isError).toBe(true);
+    expect(text(bad)).toContain("1 to 1440");
+    expect(server.graphSends()).toHaveLength(0);
+    expect(existsSync(watchPath)).toBe(false);
+
+    // The watcher's own entries must survive the append untouched.
+    const earlier = {
+      message_id: "wamid.older",
+      chat_id: owner,
+      preview: "older",
+      sent_at: "2026-10-18T09:00:00.000Z",
+      escalate_after_min: 5,
+      escalated: true,
+      escalated_at: "2026-10-18T09:05:00.000Z",
+    };
+    writeFileSync(watchPath, JSON.stringify([earlier]));
+    const urgentText = "Server is down. " + "x".repeat(200);
+    const sent = await tool("reply", {
+      chat_id: owner,
+      text: urgentText,
+      urgent_minutes: 15,
+    });
+    expect(sent.isError).not.toBe(true);
+    expect(text(sent)).toContain("sent (id: sent-1)");
+    expect(text(sent)).toContain("escalates if still unread after 15 min");
+    const watch = JSON.parse(readFileSync(watchPath, "utf8"));
+    expect(watch).toHaveLength(2);
+    expect(watch[0]).toEqual(earlier);
+    expect(Object.keys(watch[1]).sort()).toEqual([
+      "chat_id",
+      "escalate_after_min",
+      "escalated",
+      "message_id",
+      "preview",
+      "sent_at",
+    ]);
+    expect(watch[1]).toMatchObject({
+      message_id: "sent-1",
+      chat_id: owner,
+      preview: urgentText.slice(0, 120),
+      escalate_after_min: 15,
+      escalated: false,
+    });
+    expect(Number.isFinite(Date.parse(watch[1].sent_at))).toBe(true);
+
+    expect(
+      text(
+        await tool("message_status", { chat_id: owner, message_id: "sent-1" }),
+      ),
+    ).toStartWith("sent (id: sent-1)");
+    // Ids no tool sent are not tracked, and a status for one is ignored.
+    await postStatuses([
+      { id: "wamid.unknown", status: "read", recipient_id: "886900000001" },
+    ]);
+    expect(
+      text(
+        await tool("message_status", {
+          chat_id: owner,
+          message_id: "wamid.unknown",
+        }),
+      ),
+    ).toContain("no status on record");
+
+    // Statuses are applied off the request path, so poll for each one.
+    const statusOnceItIs = async (state: string): Promise<string> => {
+      let answer = "";
+      for (let i = 0; i < 100; i++) {
+        answer = text(
+          await tool("message_status", {
+            chat_id: owner,
+            message_id: "sent-1",
+          }),
+        );
+        if (answer.startsWith(state)) break;
+        await pause(50);
+      }
+      return answer;
+    };
+    await postStatuses([
+      { id: "sent-1", status: "delivered", recipient_id: "886900000001" },
+    ]);
+    const delivered = await statusOnceItIs("delivered");
+    expect(delivered).toStartWith("delivered (id: sent-1)");
+    expect(delivered).toContain("read: not yet");
+
+    await postStatuses([
+      { id: "sent-1", status: "read", recipient_id: "886900000001" },
+    ]);
+    const read = await statusOnceItIs("read");
+    expect(read).toStartWith("read (id: sent-1)");
+    expect(read).toContain("read by: ");
+
+    // The other chat's id is refused, not answered.
+    const other = await tool("message_status", {
+      chat_id: "886900000005@s.whatsapp.net",
+      message_id: "sent-1",
+    });
+    expect(other.isError).toBe(true);
+
+    // Debounced to disk within ~2 s, in the shape the watcher reads.
+    await until(() => {
+      if (!existsSync(receiptsPath)) return false;
+      const r = JSON.parse(readFileSync(receiptsPath, "utf8"))["sent-1"];
+      return !!r?.read_at;
+    });
+    const record = JSON.parse(readFileSync(receiptsPath, "utf8"))["sent-1"];
+    expect(Object.keys(record).sort()).toEqual([
+      "chat_id",
+      "delivered_at",
+      "read_at",
+      "read_by",
+      "sent_at",
+    ]);
+    expect(record.chat_id).toBe(owner);
+    expect(record.read_by).toEqual([owner]);
+    expect(Date.parse(record.read_at)).toBeGreaterThanOrEqual(
+      Date.parse(record.delivered_at),
     );
   } finally {
     await server.close();

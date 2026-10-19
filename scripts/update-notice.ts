@@ -57,6 +57,14 @@ if (!isStaticMode()) {
   // latest.
   const CHANGELOG: { version: string; notes: string[] }[] = [
     {
+      version: "0.30.0",
+      notes: [
+        "New message_status tool: was a message Claude sent delivered or read, when, and by whom.",
+        "Receipts are kept 7 days in ~/.whatsapp-channel/receipts.json (linked device and Cloud API).",
+        "reply takes urgent_minutes (1-1440) to list a message in urgent-watch.json for your watcher.",
+      ],
+    },
+    {
       version: "0.29.0",
       notes: [
         "Linked device: new send_poll tool sends a WhatsApp poll with 2 to 12 options.",

@@ -96,6 +96,25 @@ import {
   readReceiptsEnabled,
 } from "./lib/read-receipts";
 import {
+  addReceipt,
+  appendWatchEntry,
+  applyReceipt,
+  cloudStatusEvent,
+  describeReceipt,
+  parseReceiptStore,
+  pruneReceipts,
+  RECEIPT_TTL_MS,
+  serializeReceiptStore,
+  statusEvent,
+  urgentMinutes,
+  userReceiptEvent,
+  watchEntry,
+  type ReceiptEvent,
+  type ReceiptRecord,
+  type UrgentWatchEntry,
+} from "./lib/receipts";
+import { withFileLock } from "./lib/file-lock";
+import {
   formatLock,
   lockHolderState,
   lockIdentity,
@@ -180,6 +199,13 @@ const SENT_LOG = join(STATE_DIR, "sent.jsonl");
 // Every poll send_poll sent in the last 30 days, with the secret its votes
 // are sealed with (see lib/polls.ts). Without it a vote cannot be read.
 const POLLS_FILE = join(STATE_DIR, "polls.json");
+// Delivery and read receipts for what the tools sent (reply, send_poll,
+// send_template), keyed by message id, 7 days (see lib/receipts.ts).
+const RECEIPTS_FILE = join(STATE_DIR, "receipts.json");
+// reply's urgent_minutes appends here. A watcher outside this server reads
+// it with receipts.json, escalates what stays unread and rewrites it, both
+// sides under a flock on URGENT_WATCH_FILE + ".lock" (see lib/file-lock.ts).
+const URGENT_WATCH_FILE = join(STATE_DIR, "urgent-watch.json");
 // Epoch-ms of the last address-book resync attempt (see syncSavedNamesOnce).
 // On disk, not in memory: the in-process cooldown resets every time the
 // watchdog cycles the server, and for an account with genuinely zero saved
@@ -1123,6 +1149,8 @@ async function becomePrimary(): Promise<void> {
   // replacing kept appending since. Re-read (pruneMessageLog -> pruneSentLog)
   // before the socket opens, or its replayed sends read as hand replies.
   pruneMessageLog();
+  // Same reason: the receipts the replaced primary recorded since our boot.
+  loadReceipts();
   await startIpcListener();
   await connectWhatsApp();
 }
@@ -2436,6 +2464,120 @@ function savePolls(): void {
   }
 }
 
+// ─── Delivery / read receipts (survive restart) ─────────────────────────
+
+// Only messages a tool sent are tracked (trackReceipt): the owner's own
+// sends from the phone and every inbound message are never in here, so a
+// receipt for any other id is ignored. Primary-only: a secondary runs no
+// tool and holds no socket, so it never adds or applies one. Loaded in
+// becomePrimary, not at boot, because a promoted secondary must read what
+// the primary it replaces wrote after this process started.
+let receipts = new Map<string, ReceiptRecord>();
+let receiptsSaveTimer: ReturnType<typeof setTimeout> | undefined;
+// A busy group delivers a burst of per-member receipts at once; one whole-file
+// rewrite per receipt would be wasted work. Changes inside this window are
+// written together, so the file is written at most once per window.
+const RECEIPTS_SAVE_MS = 2000;
+
+function loadReceipts(): void {
+  try {
+    receipts = parseReceiptStore(
+      existsSync(RECEIPTS_FILE) ? readFileSync(RECEIPTS_FILE, "utf8") : "",
+      Date.now() - RECEIPT_TTL_MS,
+    );
+  } catch {
+    receipts = new Map();
+  }
+}
+
+function saveReceipts(): void {
+  if (receiptsSaveTimer) clearTimeout(receiptsSaveTimer);
+  receiptsSaveTimer = undefined;
+  // Never throws into a send or an event handler: the worst case is a
+  // receipt the next save writes, or one lost to a crash before it.
+  try {
+    pruneReceipts(receipts, Date.now() - RECEIPT_TTL_MS);
+    const tmp = RECEIPTS_FILE + ".tmp";
+    writeFileSync(tmp, serializeReceiptStore(receipts), { mode: 0o600 });
+    renameSync(tmp, RECEIPTS_FILE);
+  } catch (err) {
+    logDiag(`${LOG_PREFIX}: failed to persist receipts: ${err}\n`);
+  }
+}
+
+function scheduleReceiptsSave(): void {
+  if (receiptsSaveTimer) return;
+  receiptsSaveTimer = setTimeout(saveReceipts, RECEIPTS_SAVE_MS);
+  receiptsSaveTimer.unref?.();
+}
+
+/** Starts tracking delivery and read for a message a tool just sent. Called
+ *  right after each send, before the next await, so a receipt for an early
+ *  part of a multi-part reply cannot arrive before its id is known. */
+function trackReceipt(chatId: string, id: string | null | undefined): void {
+  if (!id) return;
+  const now = Date.now();
+  if (addReceipt(receipts, id, chatId, now, now - RECEIPT_TTL_MS))
+    scheduleReceiptsSave();
+}
+
+function recordReceipt(
+  id: string | null | undefined,
+  event: ReceiptEvent | undefined,
+): void {
+  if (!id || !event) return;
+  const record = receipts.get(id);
+  if (record && applyReceipt(record, event)) scheduleReceiptsSave();
+}
+
+// The same key every other identity lookup uses (see contactKey), so a reader
+// whose receipt came from their @lid is stored, and named, by phone number
+// wherever the mapping is known.
+function readerJid(jid: string | null | undefined): string | undefined {
+  return jid ? jidNormalizedUser(resolveToPhone(jid)) : undefined;
+}
+
+// Resolved the way group_roster names members: a saved name, or a masked
+// number, never a raw one.
+function readerName(jid: string): string {
+  const phone = resolveToPhone(jid);
+  const name = safeName(contactName(contactsMap, contactKey(phone)));
+  return name && !looksLikeNumber(name) ? name : maskNumber(phone);
+}
+
+/** Appends reply's urgent entry under the watcher's flock. Returns what the
+ *  tool result says about it; never throws, since the message is already
+ *  sent by the time this runs. */
+function appendUrgentWatch(entry: UrgentWatchEntry): string {
+  try {
+    const { locked } = withFileLock(URGENT_WATCH_FILE + ".lock", () => {
+      let text = "";
+      try {
+        text = readFileSync(URGENT_WATCH_FILE, "utf8");
+      } catch {}
+      const { json, discarded } = appendWatchEntry(text, entry);
+      if (discarded) {
+        const aside = `${URGENT_WATCH_FILE}.corrupt-${Date.now()}`;
+        renameSync(URGENT_WATCH_FILE, aside);
+        logDiag(
+          `${LOG_PREFIX}: urgent-watch.json was not a JSON array; kept as ${basename(aside)}\n`,
+        );
+      }
+      const tmp = `${URGENT_WATCH_FILE}.${process.pid}.tmp`;
+      writeFileSync(tmp, json, { mode: 0o600 });
+      renameSync(tmp, URGENT_WATCH_FILE);
+    });
+    if (!locked)
+      logDiag(
+        `${LOG_PREFIX}: urgent-watch.json written without its lock (no flock here, or the watcher held it too long)\n`,
+      );
+    return ` Urgent: watched; escalates if still unread after ${entry.escalate_after_min} min.`;
+  } catch (err) {
+    logDiag(`${LOG_PREFIX}: failed to record urgent watch: ${err}\n`);
+    return ` Urgent watch NOT recorded (${err instanceof Error ? err.message : String(err)}).`;
+  }
+}
+
 // ─── Message persistence (survives restart) ─────────────────────────────
 
 interface MessageLogEntry {
@@ -2840,6 +2982,9 @@ function pruneMessageLog(): void {
   // yet, and sent.jsonl can exist without it (pairing notices go to chats
   // that are never logged).
   pruneSentLog();
+  // Hourly too, not only on a save, so a quiet week still ages them out.
+  if (pruneReceipts(receipts, Date.now() - RECEIPT_TTL_MS))
+    scheduleReceiptsSave();
   pruneStrangerCaches();
   pruneInbox();
   // Age the aged-out record BEFORE the early return below. Its 30-day expiry
@@ -3409,6 +3554,13 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
                   description:
                     "Absolute file paths to attach. Images send as photos, videos as video, .mp3/.m4a as audio, and an Ogg Opus .ogg/.opus as a voice note (Cloud API: .ogg as plain audio); other types as documents. Max 16MB each.",
                 },
+                urgent_minutes: {
+                  type: "number",
+                  minimum: 1,
+                  maximum: 1440,
+                  description:
+                    "Optional, 1 to 1440. Marks this message urgent: it is added to ~/.whatsapp-channel/urgent-watch.json, where a watcher you run can escalate it if it is still unread (no blue ticks) after this many minutes. Only for something that really needs attention. Someone with read receipts turned off never shows as read.",
+                },
               },
               required: ["chat_id", "text"],
             },
@@ -3580,6 +3732,28 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
                 unpin: {
                   type: "boolean",
                   description: "true removes the pin instead of setting one.",
+                },
+              },
+              required: ["chat_id", "message_id"],
+            },
+          },
+          {
+            name: "message_status",
+            annotations: {
+              title: "WhatsApp message delivery and read status",
+              readOnlyHint: true,
+              destructiveHint: false,
+            },
+            description:
+              "Whether a message this agent sent with reply, send_poll or send_template in the last 7 days was delivered and read: sent, delivered or read, with UTC times and who read it (a saved name or a masked number). In a group, read by lists each member whose read receipt arrived. Someone with read receipts turned off never shows as read, so 'delivered' is not proof it went unseen.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                chat_id: { type: "string" },
+                message_id: {
+                  type: "string",
+                  description:
+                    "An id from reply's, send_poll's or send_template's result.",
                 },
               },
               required: ["chat_id", "message_id"],
@@ -3783,6 +3957,7 @@ const handleToolCall = async (
           components: template.components as Json[] | undefined,
         });
         if (sent?.key) trackSent(sent.key);
+        trackReceipt(template.chat_id, sent?.key.id);
         persistMessage({
           id: sent?.key.id ?? `template-${Date.now()}`,
           chat_id: template.chat_id,
@@ -3812,6 +3987,8 @@ const handleToolCall = async (
         const files = (args.files as string[] | undefined) ?? [];
         const rawMentions = (args.mentions as string[] | undefined) ?? [];
         const isAllToken = (m: string) => isReservedAllToken(m, contactsMap);
+        // Checked first, so a bad value fails the call before anything is sent.
+        const urgent = urgentMinutes(args.urgent_minutes);
 
         // Checked before any mention work: "all" triggers a live
         // groupMetadata() fetch below, and that must never run for a chat
@@ -3966,7 +4143,10 @@ const handleToolCall = async (
           );
           if (sent?.key) {
             trackSent(sent.key);
-            if (sent.key.id) sentIds.push(sent.key.id);
+            if (sent.key.id) {
+              sentIds.push(sent.key.id);
+              trackReceipt(chat_id, sent.key.id);
+            }
           }
           const docSent = await sock.sendMessage(chat_id, {
             document: readFileSync(docPath),
@@ -3980,7 +4160,10 @@ const handleToolCall = async (
           });
           if (docSent?.key) {
             trackSent(docSent.key);
-            if (docSent.key.id) sentIds.push(docSent.key.id);
+            if (docSent.key.id) {
+              sentIds.push(docSent.key.id);
+              trackReceipt(chat_id, docSent.key.id);
+            }
           }
           rmSync(docPath, { force: true });
         } else {
@@ -4001,7 +4184,10 @@ const handleToolCall = async (
             );
             if (sent?.key) {
               trackSent(sent.key);
-              if (sent.key.id) sentIds.push(sent.key.id);
+              if (sent.key.id) {
+                sentIds.push(sent.key.id);
+                trackReceipt(chat_id, sent.key.id);
+              }
             }
           }
         }
@@ -4022,7 +4208,10 @@ const handleToolCall = async (
           }
           if (sent?.key) {
             trackSent(sent.key);
-            if (sent.key.id) sentIds.push(sent.key.id);
+            if (sent.key.id) {
+              sentIds.push(sent.key.id);
+              trackReceipt(chat_id, sent.key.id);
+            }
           }
         }
 
@@ -4052,10 +4241,27 @@ const handleToolCall = async (
           });
         }
 
+        // The watch names the first part: it is the one the recipient's
+        // phone shows first, and its read receipt is the one that matters.
+        const urgentNote =
+          urgent !== undefined && sentIds[0]
+            ? appendUrgentWatch(
+                watchEntry({
+                  messageId: sentIds[0],
+                  chatId: chat_id,
+                  text: outText,
+                  sentAtMs:
+                    Date.parse(receipts.get(sentIds[0])?.sent_at ?? "") ||
+                    Date.now(),
+                  minutes: urgent,
+                }),
+              )
+            : "";
         const result =
-          sentIds.length === 1
+          (sentIds.length === 1
             ? `sent (id: ${sentIds[0]})`
-            : `sent ${sentIds.length} parts (ids: ${sentIds.join(", ")})`;
+            : `sent ${sentIds.length} parts (ids: ${sentIds.join(", ")})`) +
+          urgentNote;
         return { content: [{ type: "text", text: result }] };
       }
 
@@ -4086,6 +4292,7 @@ const handleToolCall = async (
         if (!sent || !pollId)
           throw new Error("WhatsApp did not return an id for the poll");
         trackSent(sent.key);
+        trackReceipt(chat_id, pollId);
         storeMessage(sent);
         addPoll(
           sentPolls,
@@ -4275,6 +4482,42 @@ const handleToolCall = async (
         };
       }
 
+      case "message_status": {
+        const chatId = String(args.chat_id ?? "");
+        const messageId = String(args.message_id ?? "");
+        if (!chatId || !messageId)
+          throw new Error("message_status needs chat_id and message_id");
+        assertAllowedChat(chatId);
+        const record = receipts.get(messageId);
+        if (!record)
+          return {
+            content: [
+              {
+                type: "text",
+                text: `no status on record for ${messageId}: only messages sent with reply, send_poll or send_template in the last 7 days are tracked`,
+              },
+            ],
+          };
+        // A DM can be named by its phone or its @lid form; both mean one chat.
+        if (
+          record.chat_id !== chatId &&
+          readerJid(record.chat_id) !== readerJid(chatId)
+        )
+          throw new Error(`message ${messageId} is not in chat ${chatId}`);
+        return {
+          content: [
+            {
+              type: "text",
+              text: describeReceipt(
+                messageId,
+                record,
+                record.read_by.map(readerName),
+              ),
+            },
+          ],
+        };
+      }
+
       case "status": {
         if (PROVIDER === "cloud-api") {
           const cloud = sock instanceof CloudApiSocket ? sock : undefined;
@@ -4288,7 +4531,7 @@ const handleToolCall = async (
             `DM policy: ${access.dmPolicy}`,
             `Allowed contacts: ${access.allowFrom.length}`,
             `Permission owner: ${permissionTarget(access) ? "configured" : "missing or revoked; set an allowlisted personal contact as owner"}`,
-            "Supported: DMs, replies, reactions, attachments, approved templates. Groups, message editing, pinning and read receipts are unavailable in this mode.",
+            "Supported: DMs, replies, reactions, attachments, approved templates, delivery/read status of sent messages (message_status). Groups, message editing, pinning and sending read receipts are unavailable in this mode.",
             "Free-form replies require an open 24-hour service window. Meta fees and AI-provider rules apply.",
           ];
           return { content: [{ type: "text", text: lines.join("\n") }] };
@@ -4704,6 +4947,9 @@ function shutdown(): void {
   if (shuttingDown) return;
   shuttingDown = true;
   logDiag(`${LOG_PREFIX}: shutting down\n`);
+  // Receipts still waiting for their debounced write. Only a primary ever
+  // schedules one, so a secondary never writes the file here.
+  if (receiptsSaveTimer) saveReceipts();
   // Close the IPC listener here, well before the singleton lock is released
   // at the end of the grace window: a successor that acquires the lock starts
   // its own listener, and it must never do that while this socket/pipe is
@@ -5934,6 +6180,11 @@ async function connectCloudApi(): Promise<void> {
       await handlePermissionReactions([reaction]);
     },
     onStatus: (status) => {
+      // Delivered/read for what the tools sent; anything else is ignored.
+      recordReceipt(
+        status.id,
+        cloudStatusEvent(status.status, status.recipient, Date.now()),
+      );
       // Cloud accepts a send with 200 + id and reports the failure later
       // (131047: 24h window closed). Without this the reply/template/
       // permission request looks delivered and nothing reaches diag.log.
@@ -6384,6 +6635,60 @@ async function connectWhatsApp(): Promise<void> {
   // fromMe. Its id is still the map lookup, because guessing a WhatsApp
   // message id is not the weak link — the reactor check below is.
   baileysSock.ev.on("messages.reaction" as any, handlePermissionReactions);
+
+  // Delivery and read receipts for what the tools sent (see trackReceipt).
+  // A DM's arrive as a status on messages.update, sent by the recipient (so
+  // remoteJid is theirs); a group's arrive per member on
+  // message-receipt.update. The store lookup comes first: these events also
+  // carry edits, poll updates and receipts for inbound messages, none of
+  // which are in it. Neither handler may throw into Baileys' emitter.
+  baileysSock.ev.on("messages.update", (updates) => {
+    try {
+      const now = Date.now();
+      for (const { key, update } of updates) {
+        const record = key?.id ? receipts.get(key.id) : undefined;
+        if (!record || typeof update?.status !== "number") continue;
+        // A group's status is never one member's read; its readers come below.
+        const isGroupChat = !!key.remoteJid?.endsWith("@g.us");
+        const reader = isGroupChat ? undefined : readerJid(key.remoteJid);
+        // A DM's receipt comes from the person it was sent to. Only a
+        // mismatch both sides resolve to phone numbers is refused: an @lid
+        // the map does not know yet is the same person more often than not.
+        const chat = readerJid(record.chat_id);
+        if (
+          reader &&
+          chat &&
+          reader !== chat &&
+          !isLidUser(reader) &&
+          !isLidUser(chat)
+        )
+          continue;
+        recordReceipt(
+          key.id,
+          statusEvent(update.status, update.messageTimestamp, reader, now),
+        );
+      }
+    } catch (err) {
+      logDiag(`${LOG_PREFIX}: receipt update error: ${err}\n`);
+    }
+  });
+  baileysSock.ev.on("message-receipt.update", (updates) => {
+    try {
+      const now = Date.now();
+      for (const { key, receipt } of updates) {
+        if (!key?.id || !receipts.has(key.id)) continue;
+        recordReceipt(
+          key.id,
+          userReceiptEvent(
+            { ...receipt, userJid: readerJid(receipt.userJid) },
+            now,
+          ),
+        );
+      }
+    } catch (err) {
+      logDiag(`${LOG_PREFIX}: group receipt error: ${err}\n`);
+    }
+  });
 }
 
 if (!CONFLICT) {
